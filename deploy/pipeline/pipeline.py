@@ -776,37 +776,48 @@ class PipePredictor(object):
             # --- License Plate Recognition ---
             print("[DEBUG] Starting License Plate Recognition block...")
             # --- License Plate Recognition (Corrected and Robust Version) ---
+            # --- License Plate Recognition (Final Debugging Version) ---
             if self.with_vehicleplate:
+                print("[DEBUG] Starting License Plate Recognition block...")
                 # Loop through each detected vehicle from the tracker one by one
                 for i, track_id in enumerate(online_ids):
-                    # Only process a vehicle if we haven't already found its plate
                     if track_id not in all_tracked_ids_with_plates:
-                        # Get the bounding box for the current vehicle
                         box = online_boxes[i]
-                        # Crop the vehicle image from the main frame
+                        
+                        # --- Add a check for valid box dimensions ---
+                        if box[2] <= box[0] or box[3] <= box[1]:
+                            print(f"[DEBUG] Invalid box dimensions for track_id {track_id}: {box}. Skipping.")
+                            continue
+
                         cropped_image = frame[box[1]:box[3], box[0]:box[2]]
                         
-                        # Ensure the cropped image is not empty before processing
                         if cropped_image.size == 0:
                             continue
 
-                        # Ensure the image is 3-channel BGR (fixes IndexError)
+                        # --- Add print statements to inspect the crop ---
+                        print(f"[DEBUG] Processing track_id: {track_id}, Box: {box}, Crop Shape: {cropped_image.shape}")
+
+                        # --- Save the crop to a file for visual inspection ---
+                        # This will save the image that is about to be processed.
+                        # If the script crashes, the last image saved is the one that caused it.
+                        cv2.imwrite(f"/content/debug_crop_{track_id}.png", cropped_image)
+
                         if len(cropped_image.shape) == 2:
                             cropped_image = cv2.cvtColor(cropped_image, cv2.COLOR_GRAY2BGR)
 
-                        # Call platelicense detector on the single cropped image (fixes TypeError)
-                        platelicense_result = self.vehicleplate_detector.get_platelicense(cropped_image)
-                        
-                        # The function returns a dictionary, get the plate text
-                        plate_text = platelicense_result.get('plate')
-                        
-                        # If a plate is found, store it in our dictionary
-                        if plate_text:
-                            # The result is often in a list, so we take the first element
-                            plate_text = plate_text[0] 
-                            print(f"Frame {frame_id}: Found Plate '{plate_text}' for Track ID {track_id}")
-                            all_tracked_ids_with_plates[track_id] = plate_text
+                        try:
+                            platelicense_result = self.vehicleplate_detector.get_platelicense(cropped_image)
+                            plate_text = platelicense_result.get('plate')
+                            
+                            if plate_text:
+                                plate_text = plate_text[0] 
+                                print(f"Frame {frame_id}: Found Plate '{plate_text}' for Track ID {track_id}")
+                                all_tracked_ids_with_plates[track_id] = plate_text
+                        except Exception as e:
+                            # Add a try-except block to catch any possible Python-level errors
+                            print(f"[DEBUG] ERROR during get_platelicense for track_id {track_id}: {e}")
 
+                print("[DEBUG] Finished License Plate Recognition block.")
             # 4. Trigger Cognition Layer
 
             # ... (your license plate code) ...
