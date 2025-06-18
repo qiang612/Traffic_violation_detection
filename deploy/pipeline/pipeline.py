@@ -751,16 +751,24 @@ class PipePredictor(object):
 
         while (True):
             ret, frame = capture.read()
+            # --- DEBUG PRINT 1: Check if video frame was read ---
+            print(f"[DEBUG] Reading next frame. Success (ret): {ret}")
+
             if not ret: break
             
             print(f'Thread: {thread_idx}; frame id: {frame_id}')
 
             # 2. Perception Layer
             res = self.mot_predictor.predict_image([frame.copy()], visual=False)
+            # --- DEBUG PRINT 2: Check if the MOT model ran ---
+            print(f"[DEBUG] MOT predictor finished for frame {frame_id}.")
             mot_res = parse_mot_res(res)
+
             
             if mot_res is None or len(mot_res['boxes']) == 0:
                 frame_id += 1
+                # --- DEBUG PRINT 3: Confirm the end of the loop iteration ---
+                print(f"[DEBUG] End of loop for frame {frame_id - 1}. Continuing to next frame.")
                 continue
 
             online_ids = mot_res['boxes'][:, 0].astype('int').tolist()
