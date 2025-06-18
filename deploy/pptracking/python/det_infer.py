@@ -431,6 +431,7 @@ def load_predictor(model_dir,
         config.enable_use_gpu(200, 0)
         # optimize graph and fuse op
         config.switch_ir_optim(True)
+        config.delete_pass("conv_fusion_pass")
     elif device == 'XPU':
         if config.lite_engine_enabled():
             config.enable_lite_engine()
