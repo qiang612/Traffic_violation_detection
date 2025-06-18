@@ -245,27 +245,25 @@ class PlateRecognizer(object):
         self.textrecognizer = TextRecognizer(args, cfg, use_gpu=use_gpu)
 
     def get_platelicense(self, image_list):
-        # --- START: MODIFICATION ---
-        # 1. Create a new list to hold images that are guaranteed to be 3-channel.
-        processed_image_list = []
+        # --- START: 解决内存问题的关键修改 ---
+        # 创建一个新的列表，存放缩小后的图片
+        resized_image_list = []
         for img in image_list:
-            # 2. Check if the image is grayscale (shape has 2 dimensions instead of 3).
-            if len(img.shape) == 2:
-                # 3. If it's grayscale, convert it to 3-channel BGR format.
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            processed_image_list.append(img)
-        # --- END: MODIFICATION ---
+            # 将大尺寸的车辆截图，统一缩小到512x512，极大降低内存消耗
+            resized_img = cv2.resize(img, (512, 512))
+            resized_image_list.append(resized_img)
+        # --- END: 关键修改结束 ---
 
         plate_text_list = []
         
-        # 4. Use the new 'processed_image_list' for plate detection.
-        plateboxes, det_time = self.platedetector.predict_image(processed_image_list)
+        # 使用缩小后的图片列表进行车牌检测
+        plateboxes, det_time = self.platedetector.predict_image(resized_image_list)
 
         for idx, boxes_pcar in enumerate(plateboxes):
             plate_pcar_list = []
             for box in boxes_pcar:
-                # 5. IMPORTANT: Use the same 'processed_image_list' for cropping to maintain consistency.
-                plate_images = get_rotate_crop_image(processed_image_list[idx], box)
+                # 使用缩小后的图片来截取车牌，确保坐标匹配
+                plate_images = get_rotate_crop_image(resized_image_list[idx], box)
                 
                 plate_texts = self.textrecognizer.predict_text([plate_images])
                 plate_pcar_list.append(plate_texts)
