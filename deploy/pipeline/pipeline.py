@@ -12,6 +12,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# deploy/pipeline/py 的顶部
+import os
+import requests 
+import json     
+import base64   
+import cv2      
+import numpy as np 
+
+# --- 全局API及模型配置 ---
+# 警告：这种方法不安全，请勿在共享或公开的代码中使用
+ARK_API_KEY = "baab7418-edcc-44e5-bc06-4f9de8240876" # 直接将密钥写在这里
+# os.environ['ARK_API_KEY'] = "baab7418-edcc-44e5-bc06-4f9de8240876"
+ARK_API_KEY = os.environ.get('ARK_API_KEY')
+ARK_VQA_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+ARK_VQA_MODEL = "ep-20250618010033-g4898"
+
+# --- 全自动分析的“大师级”Prompt ---
+MASTER_PROMPT = """
+你是一位资深的交通警察和AI分析专家。你的任务是仔细审查这张包含多个被白色方框和ID标记的车辆的交通监控截图，找出所有正在发生的交通违法行为。
+
+请重点关注但不限于以下行为：
+1.  **压黄实线**: 车辆车轮是否碾压或越过黄色的实线。
+2.  **违章停车**: 车辆是否在禁止停车的区域（如路肩、行车道）处于长时间静止状态。
+3.  **占用应急车道**: 车辆是否行驶在最右侧的应急车道内。
+4.  **未戴头盔**: 骑行电动车或摩托车的人员是否未佩戴头盔。
+
+请严格按照以下JSON数组格式返回你的分析结果，不要添加任何额外的解释和文字。
+- 如果发现违法行为，返回一个包含多个对象的JSON数组，每个对象必须包含 "track_id" (整数型) 和 "violation_type" (字符串)。
+- 如果没有发现任何违法行为，请只返回一个空数组 `[]`。
+
+示例返回:
+[
+  {"track_id": 15, "violation_type": "压黄实线"},
+  {"track_id": 21, "violation_type": "未戴头盔"}
+]
+"""
+
 import os
 import yaml
 import glob
@@ -22,7 +59,6 @@ import paddle
 import sys
 import copy
 import threading
-
 import queue
 import time
 from collections import defaultdict
@@ -66,6 +102,57 @@ from ppvehicle.lane_seg_infer import LaneSegPredictor
 
 from download import auto_download_model
 
+def analyze_image_with_ark_vlm(frame, prompt_text):
+    """
+    Calls the Volcano Engine Ark platform's VQA model to analyze an image,
+    with a fix for UTF-8 encoding.
+    """
+    if not ARK_API_KEY:
+        print("Error: The API key (ARK_API_KEY) is not configured.")
+        return "Error: API key not configured"
+
+    # Header now explicitly states UTF-8 charset
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Authorization": f"Bearer {ARK_API_KEY}"
+    }
+
+    _, buffer = cv2.imencode('.jpg', frame)
+    base64_frame = base64.b64encode(buffer).decode('utf-8')
+    image_url_for_api = f"data:image/jpeg;base64,{base64_frame}"
+
+    payload = {
+        "model": ARK_VQA_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt_text},
+                    {"type": "image_url", "image_url": {"url": image_url_for_api}}
+                ]
+            }
+        ]
+    }
+
+    try:
+        # This is the critical fix:
+        # We manually dump the json with Chinese characters and encode it to utf-8 bytes.
+        response = requests.post(
+            ARK_VQA_ENDPOINT,
+            headers=headers,
+            data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+            timeout=60
+        )
+        response.raise_for_status()
+        answer = response.json().get("choices")[0].get("message").get("content")
+        return answer
+    except Exception as e:
+        print(f"Error calling Volcano Engine VLM API: {e}")
+        if 'response' in locals() and hasattr(response, 'text'):
+            print(f"API raw response content: {response.text}")
+        return f"Error: {e}"
+# class Pipeline(object):
+# ...
 
 class Pipeline(object):
     """
@@ -196,7 +283,6 @@ class Pipeline(object):
         else:
             self.predictor.run(self.input)
 
-
 def get_model_dir(cfg):
     """
         Auto download inference model if the model_path is a url link.
@@ -236,7 +322,6 @@ def get_model_dir(cfg):
                 model_dir = downloaded_model_dir
                 cfg[key]["model_dir"] = model_dir
             print("mot_model_dir model_dir: ", model_dir)
-
 
 class PipePredictor(object):
     """
@@ -327,7 +412,7 @@ class PipePredictor(object):
 
         self.modebase = {
             "framebased": False,
-            "videobased": False,
+            "videobased": False, 
             "idbased": False,
             "skeletonbased": False
         }
@@ -650,449 +735,92 @@ class PipePredictor(object):
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 queue.put(frame_rgb)
 
+      # =================== 3. 最终版 predict_video 函数 ===================
     def predict_video(self, video_file, thread_idx=0):
-        # mot
-        # mot -> attr
-        # mot -> pose -> action
+        # 1. Initialization
+        final_results = {} 
+        all_tracked_ids_with_plates = {}
+
         capture = cv2.VideoCapture(video_file)
-
-        # Get Video info : resolution, fps, frame count
-        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = int(capture.get(cv2.CAP_PROP_FPS))
-        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-        print("video fps: %d, frame_count: %d" % (fps, frame_count))
-
-        if len(self.pushurl) > 0:
-            video_out_name = 'output' if self.file_name is None else self.file_name
-            pushurl = os.path.join(self.pushurl, video_out_name)
-            print("the result will push stream to url:{}".format(pushurl))
-            pushstream = PushStream(pushurl)
-            pushstream.initcmd(fps, width, height)
-        elif self.cfg['visual']:
-            video_out_name = 'output' if (
-                self.file_name is None or
-                type(self.file_name) == int) else self.file_name
-            if type(video_file) == str and "rtsp" in video_file:
-                video_out_name = video_out_name + "_t" + str(thread_idx).zfill(
-                    2) + "_rtsp"
-            if not os.path.exists(self.output_dir):
-                os.makedirs(self.output_dir)
-            out_path = os.path.join(self.output_dir, video_out_name + ".mp4")
-            fourcc = cv2.VideoWriter_fourcc(* 'mp4v')
-            writer = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
-
         frame_id = 0
+        ANALYSIS_INTERVAL = 30 
+
+        if not self.with_mot:
+            print("错误：多目标跟踪(MOT)在该配置文件中被禁用，但当前代码逻辑需要它。请使用启用了MOT的配置文件。")
+            return
+
+        while (True):
+            ret, frame = capture.read()
+            if not ret: break
+            
+            print(f'Thread: {thread_idx}; frame id: {frame_id}')
+
+            # 2. Perception Layer
+            res = self.mot_predictor.predict_image([frame.copy()], visual=False)
+            mot_res = parse_mot_res(res)
+            
+            if mot_res is None or len(mot_res['boxes']) == 0:
+                frame_id += 1
+                continue
+
+            online_ids = mot_res['boxes'][:, 0].astype('int').tolist()
+            online_boxes = mot_res['boxes'][:, 1:5].astype('int').tolist()
+
+            # 3. License Plate Recognition
+            if self.with_vehicleplate:
+                plate_results, _ = self.vehicleplate_detector.get_platelicense(frame, online_boxes)
+                for i, plate in enumerate(plate_results):
+                    if online_ids[i] not in all_tracked_ids_with_plates and plate:
+                         all_tracked_ids_with_plates[online_ids[i]] = plate
+
+            # 4. Trigger Cognition Layer
+            if frame_id % ANALYSIS_INTERVAL == 0:
+                print(f"\n--- Global Review Triggered --- [Frame:{frame_id}] Preparing to call VLM to analyze the current scene... ---")
+                
+                frame_for_vlm = frame.copy()
+                for i, track_id in enumerate(online_ids):
+                    box = online_boxes[i]
+                    cv2.rectangle(frame_for_vlm, (box[0], box[1]), (box[2], box[3]), (255, 255, 255), 2)
+                    cv2.putText(frame_for_vlm, f"ID:{track_id}", (box[0], box[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                vlm_response_str = analyze_image_with_ark_vlm(frame_for_vlm, MASTER_PROMPT)
+                print(f"VLM Global Review Response: {vlm_response_str}")
+
+                # 5. Decision Layer
+                try:
+                    violations_found = json.loads(vlm_response_str)
+                    for violation in violations_found:
+                        v_track_id = violation.get("track_id")
+                        v_type = violation.get("violation_type")
+                        if v_track_id and v_type and v_track_id in online_ids:
+                            plate = all_tracked_ids_with_plates.get(v_track_id, "未知车牌")
+                            final_results[v_track_id] = {"license_plate": plate, "violation": v_type}
+                except Exception as e:
+                    print(f"解析VLM返回的JSON时出错: {e}。原始回复: {vlm_response_str}")
 
-        entrance, records, center_traj = None, None, None
-        if self.draw_center_traj:
-            center_traj = [{}]
-        id_set = set()
-        interval_id_set = set()
-        in_id_list = list()
-        out_id_list = list()
-        prev_center = dict()
-        records = list()
-        if self.do_entrance_counting or self.do_break_in_counting or self.illegal_parking_time != -1:
-            if self.region_type == 'horizontal':
-                entrance = [0, height / 2., width, height / 2.]
-            elif self.region_type == 'vertical':
-                entrance = [width / 2, 0., width / 2, height]
-            elif self.region_type == 'custom':
-                entrance = []
-                assert len(
-                    self.region_polygon
-                ) % 2 == 0, "region_polygon should be pairs of coords points when do break_in counting."
-                assert len(
-                    self.region_polygon
-                ) > 6, 'region_type is custom, region_polygon should be at least 3 pairs of point coords.'
-
-                for i in range(0, len(self.region_polygon), 2):
-                    entrance.append(
-                        [self.region_polygon[i], self.region_polygon[i + 1]])
-                entrance.append([width, height])
-            else:
-                raise ValueError("region_type:{} unsupported.".format(
-                    self.region_type))
-
-        video_fps = fps
-
-        video_action_imgs = []
-
-        if self.with_video_action:
-            short_size = self.cfg["VIDEO_ACTION"]["short_size"]
-            scale = ShortSizeScale(short_size)
-
-        object_in_region_info = {
-        }  # store info for vehicle parking in region
-        illegal_parking_dict = None
-        cars_count = 0
-        retrograde_traj_len = 0
-        framequeue = queue.Queue(10)
-
-        thread = threading.Thread(
-            target=self.capturevideo, args=(capture, framequeue))
-        thread.start()
-        time.sleep(1)
-
-        while (not framequeue.empty()):
-            if frame_id % 10 == 0:
-                print('Thread: {}; frame id: {}'.format(thread_idx, frame_id))
-
-            frame_rgb = framequeue.get()
-            if frame_id > self.warmup_frame:
-                self.pipe_timer.total_time.start()
-
-            if self.modebase["idbased"] or self.modebase["skeletonbased"]:
-                if frame_id > self.warmup_frame:
-                    self.pipe_timer.module_time['mot'].start()
-
-                mot_skip_frame_num = self.mot_predictor.skip_frame_num
-                reuse_det_result = False
-                if mot_skip_frame_num > 1 and frame_id > 0 and frame_id % mot_skip_frame_num > 0:
-                    reuse_det_result = True
-                res = self.mot_predictor.predict_image(
-                    [copy.deepcopy(frame_rgb)],
-                    visual=False,
-                    reuse_det_result=reuse_det_result,
-                    frame_count=frame_id)
-
-                # mot output format: id, class, score, xmin, ymin, xmax, ymax
-                mot_res = parse_mot_res(res)
-                if frame_id > self.warmup_frame:
-                    self.pipe_timer.module_time['mot'].end()
-                    self.pipe_timer.track_num += len(mot_res['boxes'])
-
-                if frame_id % 10 == 0:
-                    print("Thread: {}; trackid number: {}".format(
-                        thread_idx, len(mot_res['boxes'])))
-
-                # flow_statistic only support single class MOT
-                boxes, scores, ids = res[0]  # batch size = 1 in MOT
-                mot_result = (frame_id + 1, boxes[0], scores[0],
-                              ids[0])  # single class
-                statistic = flow_statistic(
-                    mot_result,
-                    self.secs_interval,
-                    self.do_entrance_counting,
-                    self.do_break_in_counting,
-                    self.region_type,
-                    video_fps,
-                    entrance,
-                    id_set,
-                    interval_id_set,
-                    in_id_list,
-                    out_id_list,
-                    prev_center,
-                    records,
-                    ids2names=self.mot_predictor.pred_config.labels)
-                records = statistic['records']
-
-                if self.illegal_parking_time != -1:
-                    object_in_region_info, illegal_parking_dict = update_object_info(
-                        object_in_region_info, mot_result, self.region_type,
-                        entrance, video_fps, self.illegal_parking_time)
-                    if len(illegal_parking_dict) != 0:
-                        # build relationship between id and plate
-                        for key, value in illegal_parking_dict.items():
-                            plate = self.collector.get_carlp(key)
-                            illegal_parking_dict[key]['plate'] = plate
-
-                # nothing detected
-                if len(mot_res['boxes']) == 0:
-                    frame_id += 1
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.img_num += 1
-                        self.pipe_timer.total_time.end()
-                    if self.cfg['visual']:
-                        _, _, fps = self.pipe_timer.get_total_time()
-                        im = self.visualize_video(
-                            frame_rgb, mot_res, self.collector, frame_id, fps,
-                            entrance, records, center_traj)  # visualize
-                        if len(self.pushurl) > 0:
-                            pushstream.pipe.stdin.write(im.tobytes())
-                        else:
-                            writer.write(im)
-                            if self.file_name is None:  # use camera_id
-                                cv2.imshow('Paddle-Pipeline', im)
-                                if cv2.waitKey(1) & 0xFF == ord('q'):
-                                    break
-                    continue
-
-                self.pipeline_res.update(mot_res, 'mot')
-                crop_input, new_bboxes, ori_bboxes = crop_image_with_mot(
-                    frame_rgb, mot_res)
-
-                if self.with_vehicleplate and frame_id % 10 == 0:
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.module_time['vehicleplate'].start()
-                    plate_input, _, _ = crop_image_with_mot(
-                        frame_rgb, mot_res, expand=False)
-                    platelicense = self.vehicleplate_detector.get_platelicense(
-                        plate_input)
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.module_time['vehicleplate'].end()
-                    self.pipeline_res.update(platelicense, 'vehicleplate')
-                else:
-                    self.pipeline_res.clear('vehicleplate')
-
-                if self.with_human_attr:
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.module_time['attr'].start()
-                    attr_res = self.attr_predictor.predict_image(
-                        crop_input, visual=False)
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.module_time['attr'].end()
-                    self.pipeline_res.update(attr_res, 'attr')
-
-                if self.with_vehicle_attr:
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.module_time['vehicle_attr'].start()
-                    attr_res = self.vehicle_attr_predictor.predict_image(
-                        crop_input, visual=False)
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.module_time['vehicle_attr'].end()
-                    self.pipeline_res.update(attr_res, 'vehicle_attr')
-
-                if self.with_vehicle_press or self.with_vehicle_retrograde:
-                    if frame_id == 0 or cars_count == 0 or cars_count > len(
-                            mot_res['boxes']):
-
-                        if frame_id > self.warmup_frame:
-                            self.pipe_timer.module_time['lanes'].start()
-                        lanes, directions = self.laneseg_predictor.run(
-                            [copy.deepcopy(frame_rgb)])
-                        lanes_res = {'output': lanes, 'directions': directions}
-                        if frame_id > self.warmup_frame:
-                            self.pipe_timer.module_time['lanes'].end()
-
-                        if frame_id == 0 or (len(lanes) > 0 and frame_id > 0):
-                            self.pipeline_res.update(lanes_res, 'lanes')
-
-                        cars_count = len(mot_res['boxes'])
-
-                if self.with_vehicle_press:
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.module_time['vehicle_press'].start()
-                    press_lane = copy.deepcopy(self.pipeline_res.get('lanes'))
-                    if press_lane is None:
-                        continue
-
-                    vehicle_press_res_list = self.vehicle_press_predictor.mot_run(
-                        press_lane, mot_res['boxes'])
-                    vehiclepress_res = {'output': vehicle_press_res_list}
-
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.module_time['vehicle_press'].end()
-
-                    self.pipeline_res.update(vehiclepress_res, 'vehicle_press')
-
-                if self.with_idbased_detaction:
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.module_time['det_action'].start()
-                    det_action_res = self.det_action_predictor.predict(
-                        crop_input, mot_res)
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.module_time['det_action'].end()
-                    self.pipeline_res.update(det_action_res, 'det_action')
-
-                    if self.cfg['visual']:
-                        self.det_action_visual_helper.update(det_action_res)
-
-                if self.with_idbased_clsaction:
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.module_time['cls_action'].start()
-                    cls_action_res = self.cls_action_predictor.predict_with_mot(
-                        crop_input, mot_res)
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.module_time['cls_action'].end()
-                    self.pipeline_res.update(cls_action_res, 'cls_action')
-
-                    if self.cfg['visual']:
-                        self.cls_action_visual_helper.update(cls_action_res)
-
-                if self.with_skeleton_action:
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.module_time['kpt'].start()
-                    kpt_pred = self.kpt_predictor.predict_image(
-                        crop_input, visual=False)
-                    keypoint_vector, score_vector = translate_to_ori_images(
-                        kpt_pred, np.array(new_bboxes))
-                    kpt_res = {}
-                    kpt_res['keypoint'] = [
-                        keypoint_vector.tolist(), score_vector.tolist()
-                    ] if len(keypoint_vector) > 0 else [[], []]
-                    kpt_res['bbox'] = ori_bboxes
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.module_time['kpt'].end()
-
-                    self.pipeline_res.update(kpt_res, 'kpt')
-
-                    self.kpt_buff.update(kpt_res, mot_res)  # collect kpt output
-                    state = self.kpt_buff.get_state(
-                    )  # whether frame num is enough or lost tracker
-
-                    skeleton_action_res = {}
-                    if state:
-                        if frame_id > self.warmup_frame:
-                            self.pipe_timer.module_time[
-                                'skeleton_action'].start()
-                        collected_keypoint = self.kpt_buff.get_collected_keypoint(
-                        )  # reoragnize kpt output with ID
-                        skeleton_action_input = parse_mot_keypoint(
-                            collected_keypoint, self.coord_size)
-                        skeleton_action_res = self.skeleton_action_predictor.predict_skeleton_with_mot(
-                            skeleton_action_input)
-                        if frame_id > self.warmup_frame:
-                            self.pipe_timer.module_time['skeleton_action'].end()
-                        self.pipeline_res.update(skeleton_action_res,
-                                                 'skeleton_action')
-
-                    if self.cfg['visual']:
-                        self.skeleton_action_visual_helper.update(
-                            skeleton_action_res)
-
-                if self.with_mtmct and frame_id % 10 == 0:
-                    crop_input, img_qualities, rects = self.reid_predictor.crop_image_with_mot(
-                        frame_rgb, mot_res)
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.module_time['reid'].start()
-                    reid_res = self.reid_predictor.predict_batch(crop_input)
-
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.module_time['reid'].end()
-
-                    reid_res_dict = {
-                        'features': reid_res,
-                        "qualities": img_qualities,
-                        "rects": rects
-                    }
-                    self.pipeline_res.update(reid_res_dict, 'reid')
-                else:
-                    self.pipeline_res.clear('reid')
-
-            if self.with_video_action:
-                # get the params
-                frame_len = self.cfg["VIDEO_ACTION"]["frame_len"]
-                sample_freq = self.cfg["VIDEO_ACTION"]["sample_freq"]
-
-                if sample_freq * frame_len > frame_count:  # video is too short
-                    sample_freq = int(frame_count / frame_len)
-
-                # filter the warmup frames
-                if frame_id > self.warmup_frame:
-                    self.pipe_timer.module_time['video_action'].start()
-
-                # collect frames
-                if frame_id % sample_freq == 0:
-                    # Scale image
-                    scaled_img = scale(frame_rgb)
-                    video_action_imgs.append(scaled_img)
-
-                # the number of collected frames is enough to predict video action
-                if len(video_action_imgs) == frame_len:
-                    classes, scores = self.video_action_predictor.predict(
-                        video_action_imgs)
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.module_time['video_action'].end()
-
-                    video_action_res = {"class": classes[0], "score": scores[0]}
-                    self.pipeline_res.update(video_action_res, 'video_action')
-
-                    print("video_action_res:", video_action_res)
-
-                    video_action_imgs.clear()  # next clip
-
-            if self.with_vehicle_retrograde:
-                # get the params
-                frame_len = self.cfg["VEHICLE_RETROGRADE"]["frame_len"]
-                sample_freq = self.cfg["VEHICLE_RETROGRADE"]["sample_freq"]
-
-                if sample_freq * frame_len > frame_count:  # video is too short
-                    sample_freq = int(frame_count / frame_len)
-
-                # filter the warmup frames
-                if frame_id > self.warmup_frame:
-                    self.pipe_timer.module_time['vehicle_retrograde'].start()
-
-                if frame_id % sample_freq == 0:
-
-                    frame_mot_res = copy.deepcopy(self.pipeline_res.get('mot'))
-                    self.vehicle_retrograde_predictor.update_center_traj(
-                        frame_mot_res, max_len=frame_len)
-                    retrograde_traj_len = retrograde_traj_len + 1
-
-                #the number of collected frames is enough to predict
-                if retrograde_traj_len == frame_len:
-                    retrograde_mot_res = copy.deepcopy(
-                        self.pipeline_res.get('mot'))
-                    retrograde_lanes = copy.deepcopy(
-                        self.pipeline_res.get('lanes'))
-                    frame_shape = frame_rgb.shape
-
-                    if retrograde_lanes is None:
-                        continue
-                    retrograde_res, fence_line = self.vehicle_retrograde_predictor.mot_run(
-                        lanes_res=retrograde_lanes,
-                        det_res=retrograde_mot_res,
-                        frame_shape=frame_shape)
-
-                    retrograde_res_update = self.pipeline_res.get(
-                        'vehicle_retrograde')
-
-                    if retrograde_res_update is not None:
-                        retrograde_res_update = retrograde_res_update['output']
-                        if retrograde_res is not None:
-                            for retrograde_res_id in retrograde_res:
-                                if retrograde_res_id not in retrograde_res_update:
-                                    retrograde_res_update.append(
-                                        retrograde_res_id)
-                    else:
-                        retrograde_res_update = []
-
-                    retrograde_res_dict = {
-                        'output': retrograde_res_update,
-                        "fence_line": fence_line,
-                    }
-
-                    if retrograde_res is not None and len(retrograde_res) > 0:
-                        print("retrograde res:", retrograde_res)
-
-                    self.pipeline_res.update(retrograde_res_dict,
-                                             'vehicle_retrograde')
-
-                    if frame_id > self.warmup_frame:
-                        self.pipe_timer.module_time['vehicle_retrograde'].end()
-
-                    retrograde_traj_len = 0
-
-            self.collector.append(frame_id, self.pipeline_res)
-
-            if frame_id > self.warmup_frame:
-                self.pipe_timer.img_num += 1
-                self.pipe_timer.total_time.end()
             frame_id += 1
+            
+        # 6. After the loop, finalize the results
+        output_list = []
+        all_processed_ids = set(final_results.keys())
+        
+        for track_id, data in final_results.items():
+            output_list.append(data)
+            
+        for track_id, plate in all_tracked_ids_with_plates.items():
+            if track_id not in all_processed_ids:
+                output_list.append({"license_plate": plate, "violation": "无违法"})
 
-            if self.cfg['visual']:
-                _, _, fps = self.pipe_timer.get_total_time()
+        # 7. Save the JSON file
 
-                im = self.visualize_video(frame_rgb, self.pipeline_res,
-                                          self.collector, frame_id, fps,
-                                          entrance, records, center_traj,
-                                          self.illegal_parking_time != -1,
-                                          illegal_parking_dict)  # visualize
-                if len(self.pushurl) > 0:
-                    pushstream.pipe.stdin.write(im.tobytes())
-                else:
-                    writer.write(im)
-                    if self.file_name is None:  # use camera_id
-                        cv2.imshow('Paddle-Pipeline', im)
-                        if cv2.waitKey(1) & 0xFF == ord('q'):
-                            break
-
-        if self.cfg['visual'] and len(self.pushurl) == 0:
-            writer.release()
-            print('save result to {}'.format(out_path))
+        if not os.path.exists(self.output_dir):
+          os.makedirs(self.output_dir) 
+        output_json_path = os.path.join(self.output_dir, 'auto_analysis_results.json')
+        with open(output_json_path, 'w', encoding='utf-8') as f:
+            json.dump(output_list, f, ensure_ascii=False, indent=4)
+        print(f"所有分析完成！结果已保存至: {output_json_path}")
+        
+        capture.release()
 
     def visualize_video(self,
                         image_rgb,
@@ -1299,7 +1027,6 @@ class PipePredictor(object):
             print("save result to: " + out_path)
             start_idx += boxes_num_i
 
-
 def main():
     cfg = merge_cfg(FLAGS)  # use command params to update config
     print_arguments(cfg)
@@ -1308,15 +1035,20 @@ def main():
     # pipeline.run()
     pipeline.run_multithreads()
 
-
 if __name__ == '__main__':
     paddle.enable_static()
 
     # parse params from command
     parser = argsparser()
+
     FLAGS = parser.parse_args()
     FLAGS.device = FLAGS.device.upper()
     assert FLAGS.device in ['CPU', 'GPU', 'XPU', 'NPU', 'GCU'
                             ], "device should be CPU, GPU, XPU, NPU or GCU"
 
     main()
+
+
+
+
+
