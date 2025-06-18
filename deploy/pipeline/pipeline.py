@@ -766,12 +766,33 @@ class PipePredictor(object):
             online_ids = mot_res['boxes'][:, 0].astype('int').tolist()
             online_boxes = mot_res['boxes'][:, 1:5].astype('int').tolist()
 
-            # 3. License Plate Recognition
+            # 3. License Plate Recognition (Corrected)
             if self.with_vehicleplate:
-                plate_results, _ = self.vehicleplate_detector.get_platelicense(frame, online_boxes)
-                for i, plate in enumerate(plate_results):
-                    if online_ids[i] not in all_tracked_ids_with_plates and plate:
-                         all_tracked_ids_with_plates[online_ids[i]] = plate
+                # Loop through each detected vehicle from the tracker one by one
+                for i, track_id in enumerate(online_ids):
+                    # Only process a vehicle if we haven't already found its plate
+                    if track_id not in all_tracked_ids_with_plates:
+                        # Get the bounding box for the current vehicle
+                        box = online_boxes[i] 
+                        # Crop the vehicle image from the main frame
+                        cropped_image = frame[box[1]:box[3], box[0]:box[2]]
+                        
+                        # Ensure the cropped image is not empty before processing
+                        if cropped_image.size == 0:
+                            continue
+
+                        # Call platelicense detector on the single cropped image
+                        platelicense_result = self.vehicleplate_detector.get_platelicense(cropped_image)
+                        
+                        # The function returns a dictionary, get the plate text
+                        plate_text = platelicense_result.get('plate')
+                        
+                        # If a plate is found, store it in our dictionary
+                        if plate_text:
+                            # The result is often in a list, so we take the first element
+                            plate_text = plate_text[0] 
+                            print(f"Frame {frame_id}: Found Plate '{plate_text}' for Track ID {track_id}")
+                            all_tracked_ids_with_plates[track_id] = plate_text
 
             # 4. Trigger Cognition Layer
             if frame_id % ANALYSIS_INTERVAL == 0:
