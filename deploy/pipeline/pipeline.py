@@ -767,14 +767,14 @@ class PipePredictor(object):
             
             if mot_res is None or len(mot_res['boxes']) == 0:
                 frame_id += 1
-                # --- DEBUG PRINT 3: Confirm the end of the loop iteration ---
-                print(f"[DEBUG] End of loop for frame {frame_id - 1}. Continuing to next frame.")
                 continue
 
             online_ids = mot_res['boxes'][:, 0].astype('int').tolist()
             online_boxes = mot_res['boxes'][:, 1:5].astype('int').tolist()
 
             # 3. License Plate Recognition (Corrected)
+            # --- License Plate Recognition ---
+            print("[DEBUG] Starting License Plate Recognition block...")
             if self.with_vehicleplate:
                 # Loop through each detected vehicle from the tracker one by one
                 for i, track_id in enumerate(online_ids):
@@ -803,16 +803,21 @@ class PipePredictor(object):
                             all_tracked_ids_with_plates[track_id] = plate_text
 
             # 4. Trigger Cognition Layer
+
+            # ... (your license plate code) ...
+            print("[DEBUG] Finished License Plate Recognition block.")
             if frame_id % ANALYSIS_INTERVAL == 0:
                 print(f"\n--- Global Review Triggered --- [Frame:{frame_id}] Preparing to call VLM to analyze the current scene... ---")
-                
+                print(f"[DEBUG] VLM TRIGGERED for frame {frame_id}. Preparing to call API...")
                 frame_for_vlm = frame.copy()
                 for i, track_id in enumerate(online_ids):
                     box = online_boxes[i]
                     cv2.rectangle(frame_for_vlm, (box[0], box[1]), (box[2], box[3]), (255, 255, 255), 2)
                     cv2.putText(frame_for_vlm, f"ID:{track_id}", (box[0], box[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 
+                print("[DEBUG] >>> Calling VLM API now...")
                 vlm_response_str = analyze_image_with_ark_vlm(frame_for_vlm, MASTER_PROMPT)
+                print("[DEBUG] <<< VLM API call finished. Response received.") # If you see this, the call was successful.
                 print(f"VLM Global Review Response: {vlm_response_str}")
 
                 # 5. Decision Layer
@@ -828,7 +833,9 @@ class PipePredictor(object):
                     print(f"解析VLM返回的JSON时出错: {e}。原始回复: {vlm_response_str}")
 
             frame_id += 1
-            
+            # --- DEBUG PRINT 3: Confirm the end of the loop iteration ---
+            print(f"[DEBUG] End of loop for frame {frame_id - 1}.")
+            print(f"[DEBUG] End of loop for frame {frame_id - 1}. Continuing to next frame.")
         # 6. After the loop, finalize the results
         output_list = []
         all_processed_ids = set(final_results.keys())
