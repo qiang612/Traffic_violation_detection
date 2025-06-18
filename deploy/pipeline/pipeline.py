@@ -22,6 +22,7 @@ import paddle
 import sys
 import copy
 import threading
+
 import queue
 import time
 from collections import defaultdict
