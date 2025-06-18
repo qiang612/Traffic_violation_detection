@@ -245,15 +245,32 @@ class PlateRecognizer(object):
         self.textrecognizer = TextRecognizer(args, cfg, use_gpu=use_gpu)
 
     def get_platelicense(self, image_list):
+        # --- START: MODIFICATION ---
+        # 1. Create a new list to hold images that are guaranteed to be 3-channel.
+        processed_image_list = []
+        for img in image_list:
+            # 2. Check if the image is grayscale (shape has 2 dimensions instead of 3).
+            if len(img.shape) == 2:
+                # 3. If it's grayscale, convert it to 3-channel BGR format.
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            processed_image_list.append(img)
+        # --- END: MODIFICATION ---
+
         plate_text_list = []
-        plateboxes, det_time = self.platedetector.predict_image(image_list)
+        
+        # 4. Use the new 'processed_image_list' for plate detection.
+        plateboxes, det_time = self.platedetector.predict_image(processed_image_list)
+
         for idx, boxes_pcar in enumerate(plateboxes):
             plate_pcar_list = []
             for box in boxes_pcar:
-                plate_images = get_rotate_crop_image(image_list[idx], box)
+                # 5. IMPORTANT: Use the same 'processed_image_list' for cropping to maintain consistency.
+                plate_images = get_rotate_crop_image(processed_image_list[idx], box)
+                
                 plate_texts = self.textrecognizer.predict_text([plate_images])
                 plate_pcar_list.append(plate_texts)
             plate_text_list.append(plate_pcar_list)
+            
         return self.check_plate(plate_text_list)
 
     def check_plate(self, text_list):
