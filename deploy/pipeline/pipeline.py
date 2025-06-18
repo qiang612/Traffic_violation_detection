@@ -775,13 +775,14 @@ class PipePredictor(object):
             # 3. License Plate Recognition (Corrected)
             # --- License Plate Recognition ---
             print("[DEBUG] Starting License Plate Recognition block...")
+            # --- License Plate Recognition (Corrected and Robust Version) ---
             if self.with_vehicleplate:
                 # Loop through each detected vehicle from the tracker one by one
                 for i, track_id in enumerate(online_ids):
                     # Only process a vehicle if we haven't already found its plate
                     if track_id not in all_tracked_ids_with_plates:
                         # Get the bounding box for the current vehicle
-                        box = online_boxes[i] 
+                        box = online_boxes[i]
                         # Crop the vehicle image from the main frame
                         cropped_image = frame[box[1]:box[3], box[0]:box[2]]
                         
@@ -789,7 +790,11 @@ class PipePredictor(object):
                         if cropped_image.size == 0:
                             continue
 
-                        # Call platelicense detector on the single cropped image
+                        # Ensure the image is 3-channel BGR (fixes IndexError)
+                        if len(cropped_image.shape) == 2:
+                            cropped_image = cv2.cvtColor(cropped_image, cv2.COLOR_GRAY2BGR)
+
+                        # Call platelicense detector on the single cropped image (fixes TypeError)
                         platelicense_result = self.vehicleplate_detector.get_platelicense(cropped_image)
                         
                         # The function returns a dictionary, get the plate text
