@@ -806,7 +806,7 @@ class PipePredictor(object):
                             cropped_image = cv2.cvtColor(cropped_image, cv2.COLOR_GRAY2BGR)
 
                         try:
-                            platelicense_result = self.vehicleplate_detector.get_platelicense(cropped_image)
+                            platelicense_result = self.vehicleplate_detector.get_platelicense([cropped_image])
                             plate_text = platelicense_result.get('plate')
                             
                             if plate_text:
