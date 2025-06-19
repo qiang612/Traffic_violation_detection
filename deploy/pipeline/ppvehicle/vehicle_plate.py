@@ -238,6 +238,8 @@ class TextRecognizer(object):
         return rec_res, time.time() - st
 
 
+# deploy/pipeline/ppvehicle/vehicle_plate.py
+
 class PlateRecognizer(object):
     def __init__(self, args, cfg):
         use_gpu = args.device.lower() == "gpu"
@@ -245,82 +247,75 @@ class PlateRecognizer(object):
         self.textrecognizer = TextRecognizer(args, cfg, use_gpu=use_gpu)
 
     def get_platelicense(self, image_list):
-        # --- START: 解决内存问题的关键修改 ---
-        # 创建一个新的列表，存放缩小后的图片
-        resized_image_list = []
-        for img in image_list:
-            # 将大尺寸的车辆截图，统一缩小到512x512，极大降低内存消耗
-            resized_img = cv2.resize(img, (512, 512))
-            resized_image_list.append(resized_img)
-        # --- END: 关键修改结束 ---
+        """
+        这个函数接收一个包含一个或多个车辆截图的列表，
+        并为每个截图返回最可信的车牌识别结果。
+        """
+        if not image_list:
+            return {"plate": []}
 
-        plate_text_list = []
+        final_plates = []
         
-        # 使用缩小后的图片列表进行车牌检测
-        plateboxes, det_time = self.platedetector.predict_image(resized_image_list)
+        # --- 内存优化：统一缩小截图尺寸 ---
+        resized_image_list = [cv2.resize(img, (512, 512)) for img in image_list]
 
-        for idx, boxes_pcar in enumerate(plateboxes):
-            plate_pcar_list = []
-            for box in boxes_pcar:
-                # 使用缩小后的图片来截取车牌，确保坐标匹配
-                plate_images = get_rotate_crop_image(resized_image_list[idx], box)
+        # 1. 在所有截图上检测车牌位置
+        # plateboxes 是一个列表，每个元素对应一个截图的检测结果
+        plateboxes, _ = self.platedetector.predict_image(resized_image_list)
+
+        # 2. 遍历每个截图的检测结果
+        for i, pboxes_for_one_car in enumerate(plateboxes):
+            # 如果当前截图没有检测到车牌
+            if pboxes_for_one_car.size == 0:
+                final_plates.append("")
+                continue
+
+            # 从当前截图中提取所有可能的车牌图片碎片
+            img_fragments_for_rec = []
+            for box in pboxes_for_one_car:
+                plate_fragment = get_rotate_crop_image(resized_image_list[i], box)
+                img_fragments_for_rec.append(plate_fragment)
+
+            if not img_fragments_for_rec:
+                final_plates.append("")
+                continue
+
+            # 3. 对所有车牌图片碎片进行一次批量文字识别
+            best_plate_text = ""
+            try:
+                # rec_results 的格式是: [('车牌1', 置信度1), ('车牌2', 置信度2), ...]
+                rec_results, _ = self.textrecognizer.predict_text(img_fragments_for_rec)
                 
-                plate_texts, _ = self.textrecognizer.predict_text([plate_images])
-                plate_pcar_list.append(plate_texts)
-            plate_text_list.append(plate_pcar_list)
+                # 4. 从所有识别结果中，找出最可信的那个
+                highest_confidence = 0.0
+                for text, confidence in rec_results:
+                    # 基本的规则：长度符合要求且置信度最高
+                    if confidence > highest_confidence and (len(text) > 2 and len(text) < 10):
+                        highest_confidence = confidence
+                        best_plate_text = self.replace_cn_code(text)
             
-        return self.check_plate(plate_text_list)
+            except Exception as e:
+                print(f"Error during batch text recognition: {e}")
+                # 即使出错，也继续处理下一张图，保持鲁棒性
+            
+            final_plates.append(best_plate_text)
 
-    def check_plate(self, text_list):
-        plate_all = {"plate": []}
-        for text_pcar in text_list:
-            platelicense = ""
-            for text_info in text_pcar:
-                text = text_info[0][0][0]
-                if len(text) > 2 and len(text) < 10:
-                    platelicense = self.replace_cn_code(text)
-            plate_all["plate"].append(platelicense)
-        return plate_all
+        # 5. 返回最终结果
+        return {"plate": final_plates}
+
 
     def replace_cn_code(self, text):
         simcode = {
-            '浙': 'ZJ-',
-            '粤': 'GD-',
-            '京': 'BJ-',
-            '津': 'TJ-',
-            '冀': 'HE-',
-            '晋': 'SX-',
-            '蒙': 'NM-',
-            '辽': 'LN-',
-            '黑': 'HLJ-',
-            '沪': 'SH-',
-            '吉': 'JL-',
-            '苏': 'JS-',
-            '皖': 'AH-',
-            '赣': 'JX-',
-            '鲁': 'SD-',
-            '豫': 'HA-',
-            '鄂': 'HB-',
-            '湘': 'HN-',
-            '桂': 'GX-',
-            '琼': 'HI-',
-            '渝': 'CQ-',
-            '川': 'SC-',
-            '贵': 'GZ-',
-            '云': 'YN-',
-            '藏': 'XZ-',
-            '陕': 'SN-',
-            '甘': 'GS-',
-            '青': 'QH-',
-            '宁': 'NX-',
-            '闽': 'FJ-',
-            '·': ' '
+            '浙': 'ZJ-', '粤': 'GD-', '京': 'BJ-', '津': 'TJ-', '冀': 'HE-', '晋': 'SX-',
+            '蒙': 'NM-', '辽': 'LN-', '黑': 'HLJ-', '沪': 'SH-', '吉': 'JL-', '苏': 'JS-',
+            '皖': 'AH-', '赣': 'JX-', '鲁': 'SD-', '豫': 'HA-', '鄂': 'HB-', '湘': 'HN-',
+            '桂': 'GX-', '琼': 'HI-', '渝': 'CQ-', '川': 'SC-', '贵': 'GZ-', '云': 'YN-',
+            '藏': 'XZ-', '陕': 'SN-', '甘': 'GS-', '青': 'QH-', '宁': 'NX-', '闽': 'FJ-', '·': ' '
         }
         for _char in text:
             if _char in simcode:
                 text = text.replace(_char, simcode[_char])
         return text
-
 
 def main():
     cfg = merge_cfg(FLAGS)
