@@ -265,7 +265,7 @@ class PlateRecognizer(object):
                 # 使用缩小后的图片来截取车牌，确保坐标匹配
                 plate_images = get_rotate_crop_image(resized_image_list[idx], box)
                 
-                plate_texts = self.textrecognizer.predict_text([plate_images])
+                plate_texts, _ = self.textrecognizer.predict_text([plate_images])
                 plate_pcar_list.append(plate_texts)
             plate_text_list.append(plate_pcar_list)
             

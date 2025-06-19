@@ -24,7 +24,7 @@ import numpy as np
 # 警告：这种方法不安全，请勿在共享或公开的代码中使用
 ARK_API_KEY = "baab7418-edcc-44e5-bc06-4f9de8240876" # 直接将密钥写在这里
 # os.environ['ARK_API_KEY'] = "baab7418-edcc-44e5-bc06-4f9de8240876"
-ARK_API_KEY = os.environ.get('ARK_API_KEY')
+# ARK_API_KEY = os.environ.get('ARK_API_KEY')
 ARK_VQA_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 ARK_VQA_MODEL = "ep-20250618010033-g4898"
 
