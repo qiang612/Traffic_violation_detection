@@ -28,21 +28,29 @@ ARK_API_KEY = "baab7418-edcc-44e5-bc06-4f9de8240876" # 直接将密钥写在这�
 ARK_VQA_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 ARK_VQA_MODEL = "ep-20250618010033-g4898"
 
-# --- 全自动分析的“大师级”Prompt ---
+# deploy/pipeline/pipeline.py
+
+# --- 全自动分析的“大师级”Prompt (v2) ---
 MASTER_PROMPT = """
-你是一位资深的交通警察和AI分析专家。你的任务是仔细审查这张包含多个被白色方框和ID标记的车辆的交通监控截图，找出所有正在发生的交通违法行为。
+你是一位顶级交通AI分析专家，任务是分析交通监控截图，识别所有交通违法行为。
 
-请重点关注但不限于以下行为：
-1.  **压黄实线**: 车辆车轮是否碾压或越过黄色的实线。
-2.  **违章停车**: 车辆是否在禁止停车的区域（如路肩、行车道）处于长时间静止状态。
-3.  **占用应急车道**: 车辆是否行驶在最右侧的应急车道内。
-4.  **未戴头盔**: 骑行电动车或摩托车的人员是否未佩戴头盔。
+**分析流程:**
+1.  **识别核心交通元素**: 首先在图中定位关键元素，尤其是地面上的**黄色实线**和**应急车道**。
+2.  **审查车辆行为**: 仔细检查每一个被白色方框和ID标记的车辆，判断其行为是否违法。
 
-请严格按照以下JSON数组格式返回你的分析结果，不要添加任何额外的解释和文字。
-- 如果发现违法行为，返回一个包含多个对象的JSON数组，每个对象必须包含 "track_id" (整数型) 和 "violation_type" (字符串)。
-- 如果没有发现任何违法行为，请只返回一个空数组 `[]`。
+**重点违法行为清单 (必须严格按此清单检查):**
+* **压黄实线**: 车辆的任何部分（特别是车轮）是否碾压或越过了任何黄色实线？这是最需要关注的违章！
+* **占用应急车道**: 车辆是否在最右侧的应急车道内行驶或停留？
+* **违章停车**: 在行车道或禁止停车区域，车辆是否处于长时间静止状态？
+* **未戴头盔**: 电动车或摩托车的驾乘人员是否未佩戴安全头盔？
 
-示例返回:
+**输出格式要求 (极为重要):**
+* **只报告发现的违法行为**。
+* 返回一个JSON数组，每个JSON对象代表一个**首次发现**的违法行为。
+* 每个对象必须包含 `"track_id"` (整数) 和 `"violation_type"` (字符串, 从上面的清单中选择)。
+* **如果图中没有发现任何违法行为，必须返回一个空数组 `[]`**。
+
+**返回示例:**
 [
   {"track_id": 15, "violation_type": "压黄实线"},
   {"track_id": 21, "violation_type": "未戴头盔"}
@@ -736,143 +744,152 @@ class PipePredictor(object):
                 queue.put(frame_rgb)
 
       # =================== 3. 最终版 predict_video 函数 ===================
+    # deploy/pipeline/pipeline.py
+
     def predict_video(self, video_file, thread_idx=0):
-        # 1. Initialization
-        final_results = {} 
-        all_tracked_ids_with_plates = {}
-
+        # 1. 初始化
         capture = cv2.VideoCapture(video_file)
-        frame_id = 0
-        ANALYSIS_INTERVAL = 30 
-
-        if not self.with_mot:
-            print("错误：多目标跟踪(MOT)在该配置文件中被禁用，但当前代码逻辑需要它。请使用启用了MOT的配置文件。")
+        if not capture.isOpened():
+            print(f"Error: Could not open video file: {video_file}")
             return
+        
+        # 获取视频属性用于保存
+        fps = int(capture.get(cv2.CAP_PROP_FPS))
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # 创建输出目录
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+            
+        # 创建视频写入器 (可选，如果需要输出标注视频)
+        # output_video_path = os.path.join(self.output_dir, 'output_video.mp4')
+        # fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
+        # video_writer = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
+        
+        # 核心数据存储
+        all_tracked_ids_with_plates = {}
+        final_violations_list = []
+        logged_violations = set() # (track_id, violation_type)
 
+        # 2. 性能与逻辑控制参数
+        frame_id = 0
+        ANALYSIS_INTERVAL = 90  # **性能优化**: 增加VLM分析间隔，从30帧改为90帧
+        VLM_MAX_WIDTH = 1280    # **性能优化**: 限制发送给VLM的图片宽度，减少上传耗时
+
+        # 3. 主循环
         while (True):
             ret, frame = capture.read()
-            # --- DEBUG PRINT 1: Check if video frame was read ---
-            print(f"[DEBUG] Reading next frame. Success (ret): {ret}")
-
             if not ret: break
             
             print(f'Thread: {thread_idx}; frame id: {frame_id}')
-
-            # 2. Perception Layer
+            
+            # --- 感知层：目标跟踪 ---
             res = self.mot_predictor.predict_image([frame.copy()], visual=False)
-            # --- DEBUG PRINT 2: Check if the MOT model ran ---
-            print(f"[DEBUG] MOT predictor finished for frame {frame_id}.")
             mot_res = parse_mot_res(res)
 
-            
             if mot_res is None or len(mot_res['boxes']) == 0:
                 frame_id += 1
                 continue
 
-            online_ids = mot_res['boxes'][:, 0].astype('int').tolist()
-            online_boxes = mot_res['boxes'][:, 1:5].astype('int').tolist()
-
-            # 3. License Plate Recognition (Corrected)
-            # --- License Plate Recognition ---
-            print("[DEBUG] Starting License Plate Recognition block...")
-            # --- License Plate Recognition (Corrected and Robust Version) ---
-            # --- License Plate Recognition (Final Debugging Version) ---
+            online_ids = mot_res['boxes'][:, 0].astype(int).tolist()
+            online_boxes = mot_res['boxes'][:, 1:5].astype(int).tolist()
+            
+            # --- 感知层：车牌识别 ---
             if self.with_vehicleplate:
-                print("[DEBUG] Starting License Plate Recognition block...")
-                # Loop through each detected vehicle from the tracker one by one
                 for i, track_id in enumerate(online_ids):
                     if track_id not in all_tracked_ids_with_plates:
                         box = online_boxes[i]
-                        
-                        # --- Add a check for valid box dimensions ---
-                        if box[2] <= box[0] or box[3] <= box[1]:
-                            print(f"[DEBUG] Invalid box dimensions for track_id {track_id}: {box}. Skipping.")
-                            continue
+                        # 优化：只对足够大的车辆截图进行识别
+                        box_w = box[2] - box[0]
+                        if box_w < 80: continue
 
                         cropped_image = frame[box[1]:box[3], box[0]:box[2]]
+                        if cropped_image.size == 0: continue
                         
-                        if cropped_image.size == 0:
-                            continue
-
-                        # --- Add print statements to inspect the crop ---
-                        print(f"[DEBUG] Processing track_id: {track_id}, Box: {box}, Crop Shape: {cropped_image.shape}")
-
-                        # --- Save the crop to a file for visual inspection ---
-                        # This will save the image that is about to be processed.
-                        # If the script crashes, the last image saved is the one that caused it.
-                        cv2.imwrite(f"/content/debug_crop_{track_id}.png", cropped_image)
-
-                        if len(cropped_image.shape) == 2:
-                            cropped_image = cv2.cvtColor(cropped_image, cv2.COLOR_GRAY2BGR)
-
                         try:
+                            # 确保传入的是列表
                             platelicense_result = self.vehicleplate_detector.get_platelicense([cropped_image])
-                            plate_text = platelicense_result.get('plate')
-                            
+                            plate_text = platelicense_result.get('plate')[0]
                             if plate_text:
-                                plate_text = plate_text[0] 
                                 print(f"Frame {frame_id}: Found Plate '{plate_text}' for Track ID {track_id}")
                                 all_tracked_ids_with_plates[track_id] = plate_text
                         except Exception as e:
-                            # Add a try-except block to catch any possible Python-level errors
                             print(f"[DEBUG] ERROR during get_platelicense for track_id {track_id}: {e}")
 
-                print("[DEBUG] Finished License Plate Recognition block.")
-            # 4. Trigger Cognition Layer
-
-            # ... (your license plate code) ...
-            print("[DEBUG] Finished License Plate Recognition block.")
+            # --- 认知层：VLM分析 (定时触发) ---
             if frame_id % ANALYSIS_INTERVAL == 0:
-                print(f"\n--- Global Review Triggered --- [Frame:{frame_id}] Preparing to call VLM to analyze the current scene... ---")
-                print(f"[DEBUG] VLM TRIGGERED for frame {frame_id}. Preparing to call API...")
+                print(f"\n--- [Frame:{frame_id}] Global Review Triggered ---")
+                
                 frame_for_vlm = frame.copy()
+                # 性能优化：缩小图片
+                h, w, _ = frame_for_vlm.shape
+                if w > VLM_MAX_WIDTH:
+                    scale = VLM_MAX_WIDTH / w
+                    new_h, new_w = int(h * scale), VLM_MAX_WIDTH
+                    frame_for_vlm = cv2.resize(frame_for_vlm, (new_w, new_h))
+                    print(f"Resized VLM frame to {new_w}x{new_h}")
+
+                # 在图片上画出所有当前追踪到的车辆
                 for i, track_id in enumerate(online_ids):
                     box = online_boxes[i]
+                    # 坐标也需要同步缩放
+                    if w > VLM_MAX_WIDTH:
+                        box = [int(b * scale) for b in box]
                     cv2.rectangle(frame_for_vlm, (box[0], box[1]), (box[2], box[3]), (255, 255, 255), 2)
                     cv2.putText(frame_for_vlm, f"ID:{track_id}", (box[0], box[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                
-                print("[DEBUG] >>> Calling VLM API now...")
-                vlm_response_str = analyze_image_with_ark_vlm(frame_for_vlm, MASTER_PROMPT)
-                print("[DEBUG] <<< VLM API call finished. Response received.") # If you see this, the call was successful.
-                print(f"VLM Global Review Response: {vlm_response_str}")
 
-                # 5. Decision Layer
+                vlm_response_str = analyze_image_with_ark_vlm(frame_for_vlm, MASTER_PROMPT)
+                print(f"VLM Response: {vlm_response_str}")
+
+                # --- 决策层：处理VLM结果 ---
                 try:
                     violations_found = json.loads(vlm_response_str)
                     for violation in violations_found:
                         v_track_id = violation.get("track_id")
                         v_type = violation.get("violation_type")
-                        if v_track_id and v_type and v_track_id in online_ids:
+                        violation_key = (v_track_id, v_type)
+
+                        # **核心逻辑：只记录第一次发现的违章**
+                        if v_track_id and v_type and violation_key not in logged_violations:
+                            logged_violations.add(violation_key)
+                            print(f"*** New Violation Logged: TrackID {v_track_id}, Type: {v_type} ***")
+
+                            # 准备保存违章图片
+                            violation_image = frame.copy()
+                            for i, track_id in enumerate(online_ids):
+                                if track_id == v_track_id:
+                                    box = online_boxes[i]
+                                    cv2.rectangle(violation_image, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 3)
+                                    cv2.putText(violation_image, f"VIOLATION: {v_type}", (box[0], box[1] - 15), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                                    break
+                            
+                            # 保存图片并获取URL(本地路径)
+                            img_name = f"violation_frame_{frame_id}_id_{v_track_id}.jpg"
+                            img_path = os.path.join(self.output_dir, img_name)
+                            cv2.imwrite(img_path, violation_image)
+                            
+                            # 生成JSON记录
                             plate = all_tracked_ids_with_plates.get(v_track_id, "未知车牌")
-                            final_results[v_track_id] = {"license_plate": plate, "violation": v_type}
+                            final_violations_list.append({
+                                "license_plate": plate,
+                                "violation_type": v_type,
+                                "violation_image_url": img_path
+                            })
                 except Exception as e:
-                    print(f"解析VLM返回的JSON时出错: {e}。原始回复: {vlm_response_str}")
+                    print(f"Error parsing VLM response: {e}. Raw: {vlm_response_str}")
 
             frame_id += 1
-            # --- DEBUG PRINT 3: Confirm the end of the loop iteration ---
-            print(f"[DEBUG] End of loop for frame {frame_id - 1}.")
-            print(f"[DEBUG] End of loop for frame {frame_id - 1}. Continuing to next frame.")
-        # 6. After the loop, finalize the results
-        output_list = []
-        all_processed_ids = set(final_results.keys())
-        
-        for track_id, data in final_results.items():
-            output_list.append(data)
-            
-        for track_id, plate in all_tracked_ids_with_plates.items():
-            if track_id not in all_processed_ids:
-                output_list.append({"license_plate": plate, "violation": "无违法"})
 
-        # 7. Save the JSON file
-
-        if not os.path.exists(self.output_dir):
-          os.makedirs(self.output_dir) 
-        output_json_path = os.path.join(self.output_dir, 'auto_analysis_results.json')
+        # 4. 循环结束后，保存最终的JSON文件
+        output_json_path = os.path.join(self.output_dir, 'traffic_violations.json')
         with open(output_json_path, 'w', encoding='utf-8') as f:
-            json.dump(output_list, f, ensure_ascii=False, indent=4)
-        print(f"所有分析完成！结果已保存至: {output_json_path}")
+            json.dump(final_violations_list, f, ensure_ascii=False, indent=4)
+        print(f"\nAnalysis complete! Violation report saved to: {output_json_path}")
         
         capture.release()
+        # if 'video_writer' in locals():
+        #     video_writer.release()
 
     def visualize_video(self,
                         image_rgb,
